@@ -1019,22 +1019,111 @@ function buyDecor(id, place = true) { const d = decorDef(id); if (!d) return fal
 // ---------------- Stock Pets ----------------
 const PETS = { sel: 0 };
 const PET_QUIPS = { up: ["is doing zoomies!", "wants a treat for that green candle!", "grew a little today!", "is showing off, nya."], down: ["is sulking under a rain cloud.", "needs a hug.", "refuses to come out of its box.", "is pouting. Give it time."] };
+// ---- shared pet wandering: feet on the ground area, random targets + pauses, facing flips, walk bob, soft separation ----
+// area = {x0, x1, y0, y1} in canvas px for the FEET (bottom-center of the sprite). Positions are floats; drawing rounds to whole pixels.
+const WALK = { speed: 1 };
+const PET_FACE = { bee: -1 };   // native facing of the art (1 = right); others are front-ish and just mirror
+function petFootPad(key) { const e = IMG[key]; if (!e) return 0; if (e.footPad != null) return e.footPad;
+  try { const [c, x] = mkCanvas(e.fw, e.fh); x.drawImage(e.img, 0, 0, e.fw, e.fh, 0, 0, e.fw, e.fh); const d = x.getImageData(0, 0, e.fw, e.fh).data; let last = e.fh - 1;
+    for (let yy = e.fh - 1; yy >= 0; yy--) { let any = false; for (let xx = 0; xx < e.fw; xx++) if (d[(yy * e.fw + xx) * 4 + 3] > 40) { any = true; break; } if (any) { last = yy; break; } }
+    e.footPad = e.fh - 1 - last; } catch (err) { e.footPad = 0; } return e.footPad; }
+function petWalkers(key, list, area) {
+  const ids = list.map(p => p.id).join(","); let st = WALK[key];
+  if (!st || st.ids !== ids) { const r = rng(hashStr(key + ids)), n = list.length;
+    st = WALK[key] = { ids, area, a: list.map((p, i) => { const x = area.x0 + (i + .5) * (area.x1 - area.x0) / n, y = area.y0 + r() * (area.y1 - area.y0);
+      return { id: p.id, x, y, tx: x, ty: y, pause: .3 + r() * 2, face: r() < .5 ? -1 : 1, walkT: r() * 3, moving: false, flips: 0, sp: 0 }; }) }; }
+  st.area = area; return st;
+}
+function stepWalkers(st, list, dt) {
+  const A = st.a, ar = st.area; dt = Math.min(dt, .05) * WALK.speed;
+  A.forEach((a, i) => { const up = list[i].up; a.sp = up ? 34 : 15;
+    if (a.pause > 0) { a.pause -= dt; a.moving = false; if (up && Math.random() < dt * .4) { a.face = -a.face; a.flips++; }   // idle: look around
+      if (a.pause <= 0) { const reach = up ? 220 : 120; let best = null, bd = -1;   // pick the roomiest of a few random targets
+        for (let k = 0; k < 6; k++) { const tx = clamp(a.x + (Math.random() - .5) * reach * 2, ar.x0, ar.x1), ty = ar.y0 + Math.random() * (ar.y1 - ar.y0);
+          const room = Math.min(...A.filter(b => b !== a).map(b => Math.hypot(b.tx - tx, (b.ty - ty) * 2))); if (room > bd) { bd = room; best = [tx, ty]; } } a.tx = best[0]; a.ty = best[1]; } }
+    else { const dx = a.tx - a.x, dy = a.ty - a.y, d = Math.hypot(dx, dy);
+      if (d < 2) { a.pause = up ? .5 + Math.random() * 2 : 1.5 + Math.random() * 3.5; a.moving = false; }
+      else { const v = Math.min(d, a.sp * dt); a.x += dx / d * v; a.y += dy / d * v * .7; a.moving = true; a.walkT += dt; const nf = dx < 0 ? -1 : 1; if (Math.abs(dx) > 2 && nf !== a.face) { a.face = nf; a.flips++; } } } });
+  // soft separation: the ground band is shallow, so keep pets apart mostly along x (sprites are ~56px wide at 2x)
+  for (let i = 0; i < A.length; i++) for (let j = i + 1; j < A.length; j++) { const a = A[i], b = A[j]; let dx = b.x - a.x; const ad = Math.abs(dx);
+    if (ad < 58) { if (ad < .01) dx = (i % 2 ? 1 : -1) * .5; const f = (58 - ad) / 58 * 240 * dt, sg = Math.sign(dx); a.x -= sg * f; b.x += sg * f;
+      if (Math.abs(a.tx - b.tx) < 58) { a.tx = clamp(a.tx - sg * 30, ar.x0, ar.x1); b.tx = clamp(b.tx + sg * 30, ar.x0, ar.x1); } } }
+  A.forEach(a => { a.x = clamp(a.x, ar.x0, ar.x1); a.y = clamp(a.y, ar.y0, ar.y1); });
+}
+// draw walkers (depth-sorted) and their labels; labels are stacked so they never overlap each other or the given UI rects
+function drawWalkers(st, list, o) {
+  const order = st.a.map((a, i) => i).sort((i, j) => st.a[i].y - st.a[j].y), heads = [], sc = 2; st.drawn = [];
+  order.forEach(i => { const a = st.a[i], it = list[i], key = "pet_" + it.type, pad = petFootPad(key), up = it.up;
+    const fx = Math.round(a.x), fy = Math.round(a.y), bob = a.moving ? (up ? Math.round(Math.abs(Math.sin(a.walkT * 11)) * 5) : (Math.floor(a.walkT * 5) % 2)) : 0;
+    const f = a.moving ? Math.floor(a.walkT * (up ? 8 : 4)) % 2 : (up ? Math.floor(T * 2 + i) % 2 : 0), sx = fx - 16 * sc, sy = fy - (32 - pad) * sc - bob;
+    rect(fx - 18 + bob, fy - 2, 36 - bob * 2, 4, "rgba(0,0,0,.3)");
+    spr(key, f, sx, sy, sc, 0, { alpha: up ? 1 : .85, flip: a.face !== (PET_FACE[it.type] || 1) });
+    let headY = sy + pad * 0; const top = fy - (32 - pad) * sc;
+    if (!up) { const cx = fx - 20, cy = top - 16; rect(cx, cy, 40, 10, C.st); rect(cx + 6, cy - 5, 26, 6, C.st); for (let k = 0; k < 3; k++) rect(cx + 6 + k * 12, cy + 12 + Math.floor((T * 40 + k * 7) % 14), 1, 4, C.cy); headY = cy - 6; }
+    else { headY = top - 4; if (Math.random() < .01) part({ kind: "heart", x: fx - 8, y: top - 6, vy: -30, life: 1.2 }); }
+    if (it.sel) rect(fx - 30, fy + 4, 60, 3, C.gl);
+    heads.push({ i, fx, fy, headY, it }); st.drawn[i] = { id: a.id, x: fx, y: fy, face: a.face, moving: a.moving }; });
+  // labels: ticker (2x) + one info line, desired just above the head
+  const L = heads.map(h => { const l2 = h.it.line2 || "", w = Math.max(h.it.label.length * 16, l2.length * 8 + (h.it.storm ? 36 : 0)) + 6, hgt = l2 ? 28 : 18;
+    return { h, w, hgt, x: clamp(h.fx - w / 2, 4, W - 4 - w), y: h.headY - hgt, want: h.headY - hgt }; }).sort((p, q) => p.want - q.want);
+  const placed = [], ui = (o.ui || []).map(r => ({ x: r[0], y: r[1], w: r[2], hgt: r[3] })), minY = o.minY || TOP + 4, ov = (p, q) => p.x < q.x + q.w + 2 && p.x + p.w + 2 > q.x && p.y < q.y + q.hgt + 2 && p.y + p.hgt + 2 > q.y;
+  L.forEach(l => { const x0 = l.x, y0 = Math.max(minY, Math.min(l.want, ...ui.map(r => r.y - l.hgt - 3))), cands = [];
+    for (let dy = 0; y0 - dy >= minY; dy += 6) for (const dx of [0, -24, 24, -48, 48, -80, 80, -120, 120, -170, 170]) cands.push([dx, -dy, Math.abs(dx) * 1.2 + dy]);
+    cands.sort((p, q) => p[2] - q[2]); let best = null;
+    for (const c of cands) { const t = { x: clamp(x0 + c[0], 4, W - 4 - l.w), y: y0 + c[1], w: l.w, hgt: l.hgt }; if (!placed.some(q => ov(t, q)) && !ui.some(q => ov(t, q))) { best = t; break; } }
+    if (best) { l.x = best.x; l.y = best.y; } else { l.x = x0; l.y = y0; }
+    l.y = Math.round(l.y); l.x = Math.round(l.x); placed.push(l); });
+  if (o.afterPets) o.afterPets();
+  placed.forEach(l => { const h = l.h, it = h.it; if (h.headY - (l.y + l.hgt) > 6) rect(Math.round(clamp(h.fx, l.x + 2, l.x + l.w - 3)), l.y + l.hgt, 1, h.headY - (l.y + l.hgt), "rgba(255,255,255,.5)");
+    rect(l.x, l.y, l.w, l.hgt, "rgba(13,11,20,.55)"); text(it.label, l.x + l.w / 2, l.y + 2, { al: "c", s: 2, c: it.sel ? C.gl : C.wh });
+    if (it.line2) { const tw = it.line2.length * 8, x0 = l.x + (l.w - tw - (it.storm ? 36 : 0)) / 2; text(it.line2, x0, l.y + 19, { c: it.col }); if (it.storm) spr("storm", Math.floor(T * 3) % 2, x0 + tw + 4, l.y + 13, 1); }
+    st.drawn[h.i].label = [l.x, l.y, l.w, l.hgt]; });
+}
+// ---- ambient background life (cheap, integer-pixel): parallax clouds, swaying tufts, bobbing flowers, glints,
+// butterflies/birds, autumn leaves, day/night light + fireflies. cfg: {sky:[y0,y1], ground:[y0,y1], seed}
+const AMB = {};
+function ambientState(key, cfg) { let a = AMB[key]; if (a) return a; const r = rng(hashStr(key));
+  a = AMB[key] = { clouds: [...Array(5)].map((_, i) => ({ x: r() * W, y: cfg.sky[0] + r() * (cfg.sky[1] - cfg.sky[0]), w: 24 + Math.floor(r() * 4) * 8, far: i < 3 })),
+    tufts: [...Array(26)].map(() => ({ x: Math.floor(8 + r() * (W - 16)), y: Math.floor(cfg.ground[0] + r() * (cfg.ground[1] - cfg.ground[0])), ph: r() * 6, flower: r() < .35, c: [C.pkl, C.gl, C.wh, C.lil][Math.floor(r() * 4)] })),
+    flies: [...Array(12)].map(() => ({ x: r() * W, y: cfg.ground[0] - 40 + r() * 70, ph: r() * 6 })), leaves: [], critter: null, nextCritter: 3 + r() * 6, glint: null };
+  return a; }
+function ambientBack(key, cfg, dt) { const a = ambientState(key, cfg), h = Season.hour, night = h >= 20 || h < 6;
+  a.clouds.forEach(c => { c.x += dt * (c.far ? 3 : 7); if (c.x > W + 40) { c.x = -c.w - 20; } const x = Math.round(c.x), y = Math.round(c.y), col = night ? "rgba(120,130,180,.25)" : c.far ? "rgba(255,255,255,.35)" : "rgba(255,255,255,.55)";
+    rect(x, y, c.w, 6, col); rect(x + 6, y - 4, c.w - 14, 4, col); rect(x + 12, y - 7, Math.max(6, c.w - 30), 3, col); });
+  a.tufts.forEach(t => { const sw = Math.round(Math.sin(T * 1.8 + t.ph + t.x * .02) * 1.2), x = t.x, y = t.y;
+    if (t.flower) { const bob = Math.round(Math.sin(T * 2.2 + t.ph)); rect(x, y - 6, 1, 6, C.grd); rect(x - 1 + sw, y - 9 + bob, 3, 3, t.c); rect(x + sw, y - 8 + bob, 1, 1, C.gl); }
+    else { rect(x, y - 4, 1, 4, C.gr); rect(x - 2 + sw, y - 5, 1, 4, C.grd); rect(x + 2 + sw, y - 6, 1, 5, C.gr); rect(x + sw, y - 6, 1, 2, C.lime); } });
+  if (!night) { if (!a.glint && Math.random() < dt * .5) a.glint = { x: Math.floor(20 + Math.random() * (W - 40)), y: Math.floor(cfg.ground[0] - 50 + Math.random() * 60), t: 0 };
+    if (a.glint) { const gl = a.glint; gl.t += dt; const s = gl.t < .3 ? 1 : gl.t < .6 ? 2 : 1; rect(gl.x - s, gl.y, s * 2 + 1, 1, "rgba(255,255,220,.8)"); rect(gl.x, gl.y - s, 1, s * 2 + 1, "rgba(255,255,220,.8)"); if (gl.t > .9) a.glint = null; } } }
+function ambientFront(key, cfg, dt) { const a = ambientState(key, cfg), h = Season.hour, night = h >= 20 || h < 6, dusk = (h >= 17 && h < 20) || (h >= 6 && h < 8);
+  // butterflies by day, birds overhead; one at a time, every few seconds
+  a.nextCritter -= dt; if (!a.critter && a.nextCritter <= 0 && !night) { const bird = Math.random() < .4, dir = Math.random() < .5 ? 1 : -1;
+    a.critter = { bird, dir, x: dir > 0 ? -10 : W + 10, y: bird ? cfg.sky[0] + Math.random() * 30 : cfg.ground[0] - 30 - Math.random() * 40, t: 0, c: [C.pkl, C.gl, C.cy][Math.floor(Math.random() * 3)] }; a.nextCritter = 6 + Math.random() * 10; }
+  const cr = a.critter; if (cr) { cr.t += dt; cr.x += cr.dir * dt * (cr.bird ? 46 : 24); const x = Math.round(cr.x), y = Math.round(cr.y + Math.sin(cr.t * (cr.bird ? 3 : 5)) * (cr.bird ? 3 : 8)), up = Math.floor(cr.t * (cr.bird ? 6 : 10)) % 2;
+    if (cr.bird) { rect(x, y, 1, 1, C.ink); rect(x - 2, y - (up ? 1 : -1), 2, 1, C.ink); rect(x + 1, y - (up ? 1 : -1), 2, 1, C.ink); }
+    else { rect(x, y, 1, 3, C.ink); rect(x - (up ? 2 : 1), y - 1, up ? 2 : 1, 2, cr.c); rect(x + 1, y - 1, up ? 2 : 1, 2, cr.c); }
+    if (x < -20 || x > W + 20) a.critter = null; }
+  // falling leaves in autumn (and Halloween)
+  if ((Season.name === "autumn" || Season.halloween) && a.leaves.length < 7 && Math.random() < dt * 1.2) a.leaves.push({ x: Math.random() * W, y: TOP, ph: Math.random() * 6, vy: 14 + Math.random() * 10, c: [C.or, C.rd, C.gl, C.br][Math.floor(Math.random() * 4)] });
+  a.leaves.forEach(l => { l.y += l.vy * dt; l.ph += dt * 2; const x = Math.round(l.x + Math.sin(l.ph) * 6), y = Math.round(l.y); rect(x, y, 2, 2, l.c); rect(x + (Math.sin(l.ph) > 0 ? 2 : -1), y + 1, 1, 1, l.c); });
+  a.leaves = a.leaves.filter(l => l.y < cfg.ground[1] + 10);
+  // light follows the day: dusk warmth, night blue + fireflies
+  if (night || dusk) rect(0, TOP, W, H - TOP, night ? "rgba(20,30,70,.38)" : "rgba(255,120,60,.12)");
+  if (night) a.flies.forEach(f => { f.ph += dt; const x = Math.round(f.x + Math.sin(f.ph * .7) * 14), y = Math.round(f.y + Math.cos(f.ph * .9) * 8), on = Math.sin(f.ph * 3 + f.x) > .2;
+    if (on) { rect(x, y, 1, 1, C.lime); rect(x - 1, y, 3, 1, "rgba(200,255,120,.35)"); rect(x, y - 1, 1, 3, "rgba(200,255,120,.35)"); } }); }
+const PET_AMB = { sky: [44, 100], ground: [196, 252] };
+const PET_AREA = { x0: 40, x1: 600, y0: 200, y1: 252 };   // grass band of bg_pets (fence ~y185, deck starts ~y256)
 SCENES.pets = {
   title: "STOCK PETS", music: "hub",
-  key(k) { const n = M.positions.length; if (!n) return false; if (k === "ArrowRight" || k === "d") PETS.sel = (PETS.sel + 1) % n; else if (k === "ArrowLeft" || k === "a") PETS.sel = (PETS.sel + n - 1) % n; else if (k === "ArrowDown" || k === "s") PETS.sel = Math.min(n - 1, PETS.sel + 4); else if (k === "ArrowUp" || k === "w") PETS.sel = Math.max(0, PETS.sel - 4); else return false; Sfx.play("select"); return true; },
-  click(x, y) { const i = M.positions.findIndex((p, i) => { const [px_, py_] = petXY(i); return x > px_ - 40 && x < px_ + 40 && y > py_ - 70 && y < py_ + 10; }); if (i >= 0) { PETS.sel = i; Sfx.play("pop"); return true; } return false; },
+  key(k) { const n = M.positions.length; if (!n) return false; if (k === "ArrowRight" || k === "d" || k === "ArrowDown" || k === "s") PETS.sel = (PETS.sel + 1) % n; else if (k === "ArrowLeft" || k === "a" || k === "ArrowUp" || k === "w") PETS.sel = (PETS.sel + n - 1) % n; else return false; Sfx.play("select"); return true; },
+  click(x, y) { const st = WALK.pets; if (!st || !st.drawn) return false; const i = st.drawn.findIndex(d => d && ((x > d.x - 34 && x < d.x + 34 && y > d.y - 70 && y < d.y + 8) || (d.label && x >= d.label[0] && x < d.label[0] + d.label[2] && y >= d.label[1] && y < d.label[1] + d.label[3])));
+    if (i >= 0) { PETS.sel = i; Sfx.play("pop"); return true; } return false; },
   draw(dt) {
-    spr("bg_pets", 0, 0, 0, 2); const pos = M.positions, tot = sum(pos.map(p => p.value)) || 1;
+    spr("bg_pets", 0, 0, 0, 2); ambientBack("pets", PET_AMB, dt); const pos = M.positions;
     if (!pos.length) { bubble(180, 150, "No positions in the snapshot yet, nya!"); return; }
-    pos.forEach((p, i) => { const [x, y] = petXY(i), up = p.dayPct >= 0, sc = 2, type = petType(p.ticker), sel = i === PETS.sel;
-      const hop = up ? Math.abs(Math.sin(T * 4 + i)) * 10 : 0, f = up ? Math.floor(T * 3 + i) % 2 : 0;
-      rect(x - 16 * sc / 2, y - 2, 16 * sc, 4, "rgba(0,0,0,.3)");
-      spr("pet_" + type, f, x - 16 * sc, y - 32 * sc - hop + (up ? 0 : 4), sc, 0, { alpha: up ? 1 : .8 });
-      const es = earningsSoon(M.W.earnings, p.ticker, M.W.asOf); if (es != null) { spr("storm", Math.floor(T * 3) % 2, x + 30, y - 32 * sc + 2, 2); text("EARN " + (es ? es + "D" : "TODAY"), x + 62, y - 32 * sc - 8, { al: "c", c: C.or }); }
-      if (!up) { const cx = x - 20, cy = y - 32 * sc - 22; rect(cx, cy, 40, 10, C.st); rect(cx + 6, cy - 5, 26, 6, C.st); for (let k = 0; k < 3; k++) rect(cx + 6 + k * 12, cy + 12 + ((T * 40 + k * 7) % 14), 1, 4, C.cy); }
-      else if (Math.random() < dt * .6) part({ kind: "heart", x: x - 8, y: y - 32 * sc - 10, vy: -30, life: 1.2 });
-      const ty = y - 32 * sc - (up ? 20 : 40); text(p.ticker, x, ty - 2 + (up ? -hop : 0), { al: "c", s: 2, c: sel ? C.gl : C.wh });
-      text(pct(p.dayPct, 2), x, y + 8, { al: "c", c: up ? C.lime : C.rd }); if (sel) { rect(x - 34, y + 20, 68, 3, C.gl); } });
+    const list = pos.map((p, i) => { const es = earningsSoon(M.W.earnings, p.ticker, M.W.asOf), up = p.dayPct >= 0;
+      return { id: p.ticker, type: petType(p.ticker), up, sel: i === PETS.sel, label: p.ticker, line2: pct(p.dayPct, 2) + (es != null ? " EARN " + (es ? es + "D" : "TODAY") : ""), storm: es != null, col: es != null ? C.or : up ? C.lime : C.rd }; });
+    const st = petWalkers("pets", list, PET_AREA); stepWalkers(st, list, dt); drawWalkers(st, list, { ui: [[0, H - 54, W, 54]], afterPets: () => ambientFront("pets", PET_AMB, dt) });
     drawParts(dt);
     const p = pos[PETS.sel % pos.length], up = p.dayPct >= 0, q = PET_QUIPS[up ? "up" : "down"][hashStr(p.ticker + M.curMonth) % 4];
     panel(8, H - 52, W - 16, 46, null, up ? C.gr : C.rd);
@@ -1042,7 +1131,7 @@ SCENES.pets = {
     text("Today " + pct(p.dayPct, 2) + "   Total " + pct(p.totalPct, 2), 20, H - 26, { c: up ? C.lime : C.rd }); text("ARROWS / CLICK: pick a pet", W - 20, H - 26, { al: "r", c: C.lil });
   },
 };
-function petXY(i) { const n = M.positions.length, perRow = Math.min(4, n), row = Math.floor(i / 4), col = i % 4, cnt = Math.min(4, n - row * 4); return [W / 2 + (col - (cnt - 1) / 2) * 150, 150 + row * 130]; }
+function petXY(i) { const d = WALK.pets && WALK.pets.drawn && WALK.pets.drawn[i]; return d ? [d.x, d.y] : [W / 2, 220]; }
 // ---------------- Boss Battles ----------------
 const BOSS = { anim: 0, dmg: [] };
 SCENES.boss = {
@@ -1395,6 +1484,8 @@ SCENES.wrapped = {
 // ===== Scenes: Wealth Wing (Miguel's pet zone + option eggs, Roth grove, options farm, dividend fountain, net worth castle, tax-loss goblins) =====
 const WEALTH_ROOMS = [["mainpets", "PET ZONE + EGGS"], ["roth", "ROTH GROVE"], ["farm", "OPTIONS FARM"], ["fountain", "DIVIDEND FOUNTAIN"], ["castle", "NET WORTH CASTLE"], ["taxgoblins", "TAX-LOSS GOBLINS"], ["royale", "BATTLE ROYALE"]];
 const wback = () => go("wealth");
+const MAINPET_AMB = { sky: [44, 96], ground: [200, 244] };
+const MAINPET_AREA = { x0: 40, x1: 600, y0: 206, y1: 240 };   // dirt arena of bg_mainpets, above the option-egg row (y >= 246)
 SCENES.wealth = {
   title: "WEALTH WING", music: "casino",
   draw(dt) {
@@ -1415,12 +1506,10 @@ SCENES.mainpets = {
   title: "MIGUEL'S PET ZONE", music: "hub", back: wback,
   click(x, y) { const i = M.W.options.findIndex((o, i) => Math.abs(eggX(i) + 24 - x) < 30 && y > 254 && y < 308); if (i >= 0) { eggPopup(M.W.options[i]); return true; } return false; },
   draw(dt) {
-    spr("bg_mainpets", 0, 0, 0, 2); const Wm = M.W, P = Wm.main.positions || [], tot = sum(P.map(p => +p.marketValue || 0)) || 1, assigned = Wm.options.filter(o => o.state === "assigned").map(o => o.symbol);
-    P.slice(0, 8).forEach((p, i) => { const row = Math.floor(i / 4), cnt = Math.min(4, P.length - row * 4), x = W / 2 + ((i % 4) - (cnt - 1) / 2) * 150, y = 136 + row * 96, up = (+p.dayPct || 0) >= 0, sc = 2;
-      const hop = up ? Math.abs(Math.sin(T * 4 + i)) * 6 : 0; spr("pet_" + petType(p.symbol), up ? Math.floor(T * 3 + i) % 2 : 0, x - 16 * sc, y - 32 * sc - hop + (up ? 0 : 3), sc, 0, { alpha: up ? 1 : .8 });
-      const storm = earningsSoon(Wm.earnings, p.symbol, Wm.asOf); if (storm != null) { spr("storm", Math.floor(T * 3) % 2, x + 18, y - 32 * sc - 34, 2); if (Math.random() < dt * 20) part({ kind: "rain", x: x + 22 + Math.random() * 40, y: y - 32 * sc - 8, vy: 160, life: .2 }); }
-      text(p.symbol, x, y - 32 * sc - 18 - hop, { al: "c", s: 2, c: C.wh });
-      text(pct(+p.dayPct || 0, 1) + (assigned.includes(p.symbol) ? " ASSIGNED" : "") + (storm != null ? " EARN " + (storm ? storm + "D" : "TODAY") : ""), x, y + 4, { al: "c", c: storm != null ? C.or : assigned.includes(p.symbol) ? C.gl : up ? C.lime : C.rd }); });
+    spr("bg_mainpets", 0, 0, 0, 2); ambientBack("mainpets", MAINPET_AMB, dt); const Wm = M.W, P = Wm.main.positions || [], tot = sum(P.map(p => +p.marketValue || 0)) || 1, assigned = Wm.options.filter(o => o.state === "assigned").map(o => o.symbol);
+    const list = P.slice(0, 8).map(p => { const up = (+p.dayPct || 0) >= 0, storm = earningsSoon(Wm.earnings, p.symbol, Wm.asOf), asg = assigned.includes(p.symbol);
+      return { id: p.symbol, type: petType(p.symbol), up, label: p.symbol, line2: pct(+p.dayPct || 0, 1) + (asg ? " ASSIGNED" : "") + (storm != null ? " EARN " + (storm ? storm + "D" : "TODAY") : ""), storm: storm != null, col: storm != null ? C.or : asg ? C.gl : up ? C.lime : C.rd }; });
+    const st = petWalkers("mainpets", list, MAINPET_AREA); stepWalkers(st, list, dt); drawWalkers(st, list, { ui: [[0, 246, W, H - 246]], afterPets: () => ambientFront("mainpets", MAINPET_AMB, dt) });
     drawParts(dt);
     text("OPTION EGGS", 12, 250, { c: C.gl }); Wm.options.forEach((o, i) => { const x = eggX(i), f = o.state === "expired" ? 3 : o.state === "assigned" ? 2 : o.level, sh = o.level === 2 ? Math.sin(T * 40) * 2 : o.level === 1 ? Math.sin(T * 12) * 2 : 0;
       spr("egg", f, Math.round(x + sh), 258, 2, 0, { alpha: o.state === "assigned" ? .6 : 1 }); if (o.alarm) text("!", x + 44, 256, { c: C.rd, s: 2 });
@@ -1510,7 +1599,7 @@ function frame(t) {
   const dt = Math.min(.05, (t - last) / 1000); last = t; T += dt; FRAME_TEXT.length = 0; BTN = []; HOVER = -1;
   g.fillStyle = C.ink; g.fillRect(0, 0, W, H);
   if (SC) { if (SC.update) SC.update(dt); SC.draw(dt); }
-  if (SCN !== "title" && SCN !== "garden" && SCN !== "vault" && SCN !== "wrapped" && SCN !== "pets") drawParts(dt);
+  if (SCN !== "title" && SCN !== "garden" && SCN !== "vault" && SCN !== "wrapped" && SCN !== "pets" && SCN !== "mainpets") drawParts(dt);
   drawHud();
   if (POPUPS.length) drawPopup();
   FOCUS = BTN.length ? clamp(FOCUS, 0, BTN.length - 1) : 0;
@@ -1552,7 +1641,7 @@ if (DEBUG) window.MC = {
   closePopups: () => { POPUPS.length = 0; }, useExample: () => useExample(), unlockAll: v => { FORCE_UNLOCK = v !== false; },
   model: () => M && { W: M.W, value: M.value, next: M.next, lifetime: M.lifetime, streak: M.streak, bosses: M.bosses, active: M.activeBoss, quests: M.quests, lastQuests: M.lastQuests, arena: M.arena, dayPct: M.dayPct, positions: M.positions.length, curMonth: M.curMonth },
   logic: { optionRisk, earningsSoon, premiumTotals, taxLossCandidates, taxSeason, castleTowers, royaleSummary, rothCountdown, recentDividends, wealthModel, questGoal, spendingQuests, detectBosses, bossHp, weekResult, resolveBets, canBet, nextRung, plantStage, interestStreak, weekKey, arenaSummary },
-  save: () => JSON.parse(JSON.stringify(S)), decor: { buy: (id, place) => buyDecor(id, place), startPlace: id => startPlace(id), placeAt: (x, y) => placeDecor(x, y), cancel: () => cancelPlace(), placing: () => GARDEN.place && { id: GARDEN.place.id, tx: GARDEN.place.tx, ty: GARDEN.place.ty, r: GARDEN.place.r }, cam: () => ({ x: Math.round(GARDEN.cam.x), y: Math.round(GARDEN.cam.y), GT }), setCam: (x, y) => { GARDEN.cam.x = x; GARDEN.cam.y = y; }, shopOpen: () => !!GARDEN.shop }, layout: () => ({ TOP, W, H }), toasts: () => TOASTS.map(t => t.msg), outfitSheets: () => Object.keys(IMG).filter(k => k.startsWith("outfit_full_") && IMG[k].w === 96 && IMG[k].h === 48).length, outfitArt: () => Object.fromEntries(OUTFITS.map(o => [o.id, outfitArtReal(o.id)])), shopIndex: id => shopList().findIndex(o => o.id === id), hubHotspots: () => JSON.parse(JSON.stringify(HUB.drawn || [])), hubWalk: (x, y) => { HUB.x = x; HUB.y = y; }, wardSel: id => { const i = shopList().findIndex(o => o.id === id); if (i >= 0) WARD.sel = i; return i; }, hatchEgg: sym => hatchEgg(M.W.options.find(o => o.symbol === sym)), setCoins: n => { S.coins = n; save(); }, buyOutfit, placeBet, betWeek: () => betWeek(), buyDecor, claimBoss: id => claimBoss(M.bosses.find(b => b.id === id)), setGoblin, garden: () => ({ cam: GARDEN.cam, rows: GARDEN.rows, cols: GARDEN.cols }),
+  save: () => JSON.parse(JSON.stringify(S)), decor: { buy: (id, place) => buyDecor(id, place), startPlace: id => startPlace(id), placeAt: (x, y) => placeDecor(x, y), cancel: () => cancelPlace(), placing: () => GARDEN.place && { id: GARDEN.place.id, tx: GARDEN.place.tx, ty: GARDEN.place.ty, r: GARDEN.place.r }, cam: () => ({ x: Math.round(GARDEN.cam.x), y: Math.round(GARDEN.cam.y), GT }), setCam: (x, y) => { GARDEN.cam.x = x; GARDEN.cam.y = y; }, shopOpen: () => !!GARDEN.shop }, clearToasts: () => { TOASTS.length = 0; }, setHour: h => { Season.hour = h; }, ambient: k => { const a = AMB[k]; return a ? { clouds: a.clouds.map(c => Math.round(c.x)), tufts: a.tufts.length, leaves: a.leaves.length, critter: !!a.critter, flies: a.flies.length } : null; }, petWalk: (k, sp) => { if (sp != null) WALK.speed = sp; const st = WALK[k]; return st ? { area: st.area, drawn: st.drawn, sp: st.a.map(a => a.sp), flips: st.a.reduce((n, a) => n + a.flips, 0) } : null; }, layout: () => ({ TOP, W, H }), toasts: () => TOASTS.map(t => t.msg), outfitSheets: () => Object.keys(IMG).filter(k => k.startsWith("outfit_full_") && IMG[k].w === 96 && IMG[k].h === 48).length, outfitArt: () => Object.fromEntries(OUTFITS.map(o => [o.id, outfitArtReal(o.id)])), shopIndex: id => shopList().findIndex(o => o.id === id), hubHotspots: () => JSON.parse(JSON.stringify(HUB.drawn || [])), hubWalk: (x, y) => { HUB.x = x; HUB.y = y; }, wardSel: id => { const i = shopList().findIndex(o => o.id === id); if (i >= 0) WARD.sel = i; return i; }, hatchEgg: sym => hatchEgg(M.W.options.find(o => o.symbol === sym)), setCoins: n => { S.coins = n; save(); }, buyOutfit, placeBet, betWeek: () => betWeek(), buyDecor, claimBoss: id => claimBoss(M.bosses.find(b => b.id === id)), setGoblin, garden: () => ({ cam: GARDEN.cam, rows: GARDEN.rows, cols: GARDEN.cols }),
   onData: () => onData(), data: () => DATA.d && { example: !!DATA.d.example, updated: DATA.d.updated }, season: () => Object.assign({}, Season),
 };
 boot();
